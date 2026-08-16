@@ -10,5 +10,13 @@
     "resume": "Resume",
     "pause": "Pause",
     "quickOpen": "Read the currently selected content",
-    "scrollToCurrent": "Scroll to current block"
+    "scrollToCurrent": "Scroll to current block",
+    "engineTitle": "Voice engine",
+    "engineOnline": "Online (Edge)",
+    "engineSystem": "System (Local)",
+    "engineLocal": "Local (WinRT)",
+    "voiceSystemNone": "No system voice detected",
+    "voiceLocalNone": "No local voice detected (start bridge first)",
+    "voiceLocalRefresh": "Refresh local voice list",
+    "localBridgeDown": "Local TTS bridge not started. Run tts_bridge.py in the plugin folder."
 }
