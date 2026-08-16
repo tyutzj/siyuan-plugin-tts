@@ -10,5 +10,13 @@
     "resume": "继续",
     "pause": "暂停",
     "quickOpen": "朗读当前选中内容",
-    "scrollToCurrent": "滚动到当前播放块"
+    "scrollToCurrent": "滚动到当前播放块",
+    "engineTitle": "语音引擎",
+    "engineOnline": "在线语音 (Edge)",
+    "engineSystem": "系统语音 (本地)",
+    "engineLocal": "本地优质语音 (WinRT)",
+    "voiceSystemNone": "未检测到系统语音",
+    "voiceLocalNone": "未检测到本地语音（请先启动桥接）",
+    "voiceLocalRefresh": "刷新本地语音列表",
+    "localBridgeDown": "本地优质语音桥接未启动，请先运行插件目录下的 tts_bridge.py"
 }
