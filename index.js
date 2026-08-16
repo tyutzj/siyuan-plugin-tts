@@ -636,6 +636,55 @@ class MsEdgeTTS {
   }
 }
 
+/**
+ * System voice engine: uses the browser/OS built-in SpeechSynthesis API.
+ * On Windows this drives the SAPI / installed system voices directly,
+ * with NO network request, so there is no online latency.
+ */
+class SystemTTS {
+  constructor() {
+    this.supported = typeof window !== 'undefined' && !!window.speechSynthesis;
+    this.synth = this.supported ? window.speechSynthesis : null;
+  }
+
+  getVoices() {
+    if (!this.supported) return [];
+    try {
+      return this.synth.getVoices() || [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Speak text using the system voice. Returns the SpeechSynthesisUtterance.
+   * @param {string} text
+   * @param {{rate?:number, voiceName?:string, lang?:string, onStart?:Function, onEnd?:Function, onError?:Function}} opts
+   */
+  speak(text, { rate = 1, voiceName = '', lang = '', onStart, onEnd, onError } = {}) {
+    if (!this.supported) {
+      throw new Error("System SpeechSynthesis is not available in this environment");
+    }
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = Math.max(0.1, Math.min(10, rate || 1));
+    if (lang) u.lang = lang;
+    if (voiceName) {
+      const v = this.getVoices().find((x) => x.name === voiceName || x.voiceURI === voiceName);
+      if (v) u.voice = v;
+    }
+    if (onStart) u.onstart = onStart;
+    if (onEnd) u.onend = onEnd;
+    if (onError) u.onerror = onError;
+    this.synth.speak(u);
+    return u;
+  }
+
+  close() {
+    if (this.supported) {
+      try { this.synth.cancel(); } catch { /* ignore */ }
+    }
+  }
+}
 const DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural";
 
 function toArrayBuffer(buf) {
@@ -658,13 +707,16 @@ class Player {
 
   loadPromise;
 
-  constructor(tts, controller) {
+  constructor(tts, controller, engine = 'edge') {
     this.controller = controller;
+    this.engine = engine;
     this.status = 0;
     this.loaded = false;
     this.loading = false;
     this.tts = tts;
     this.id = new Date().getTime();
+    this.playbackRate = 1;
+    this._playResolve = null;
   }
 
   // load block: block obj or string
@@ -680,6 +732,12 @@ class Player {
       return this.loadPromise;
     }
     logger.info(`[Player]\tloading block: '${this.content}'`);
+    if (this.engine === 'system') {
+      // System voice needs no pre-decode; it speaks live.
+      this.loaded = true;
+      this.loadPromise = Promise.resolve();
+      return this.loadPromise;
+    }
     const context = new AudioContext();
     const buffers = [];
     this.loading = true;
@@ -717,6 +775,10 @@ class Player {
   }
 
   async setRate(rate) {
+    this.playbackRate = rate;
+    if (this.engine === 'system') {
+      return Promise.resolve();
+    }
     if (!this.loaded) {
       await this.load(this.block);
     }
@@ -733,6 +795,29 @@ class Player {
     if (this.isEmpty) {
       return Promise.resolve();
     }
+    if (this.engine === 'system') {
+      if (!window.speechSynthesis) {
+        showMessage(this.controller.plugin.i18n.voiceSystemNone || "系统语音不可用");
+        return Promise.resolve();
+      }
+      this.block.highlight();
+      return new Promise((resolve) => {
+        this._playResolve = resolve;
+        const voiceName = this.controller.currentSystemVoice;
+        const u = new SpeechSynthesisUtterance(this.content);
+        u.rate = Math.max(0.1, Math.min(10, this.playbackRate || 1));
+        u.lang = 'zh-CN';
+        if (voiceName) {
+          const v = this.tts.getVoices().find((x) => x.name === voiceName || x.voiceURI === voiceName);
+          if (v) u.voice = v;
+        }
+        u.onstart = () => { this.block.highlight(); };
+        u.onend = () => { this.block.unhighlight(); this._playResolve = null; resolve(); };
+        u.onerror = () => { this.block.unhighlight(); this._playResolve = null; resolve(); };
+        this.utterance = u;
+        window.speechSynthesis.speak(u);
+      });
+    }
     this.block.highlight();
     this.source.start(0);
     return new Promise((resolve) => {
@@ -744,16 +829,40 @@ class Player {
   }
 
   stop() {
+    if (this.engine === 'system') {
+      if (window.speechSynthesis) {
+        try { window.speechSynthesis.cancel(); } catch { /* ignore */ }
+      }
+      this.block && this.block.unhighlight();
+      if (this._playResolve) {
+        const r = this._playResolve;
+        this._playResolve = null;
+        r();
+      }
+      return;
+    }
     this.source && this.source.stop();
   }
 
   pause() {
+    if (this.engine === 'system') {
+      if (window.speechSynthesis) {
+        try { window.speechSynthesis.pause(); } catch { /* ignore */ }
+      }
+      return;
+    }
     if (this.source && this.source.context) {
       this.source.context.suspend();
     }
   }
 
   resume() {
+    if (this.engine === 'system') {
+      if (window.speechSynthesis) {
+        try { window.speechSynthesis.resume(); } catch { /* ignore */ }
+      }
+      return;
+    }
     if (this.source && this.source.context) {
       this.source.context.resume();
     }
@@ -815,10 +924,16 @@ class Controller {
     this.plugin = plugin;
     this.init();
     this.maxCache = 3;
-    this.tts = new MsEdgeTTS(true);
-    const { currentMetadata, playbackRate } = config;
-    this.playbackRate = playbackRate;
-    this.tts.setMetadata(currentMetadata, OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
+    this.engine = (config.engine === 'local') ? 'edge' : (config.engine || 'edge');
+    this.currentMetadata = config.currentMetadata;
+    this.currentSystemVoice = config.currentSystemVoice || '';
+    this.playbackRate = config.playbackRate;
+    if (this.engine === 'system') {
+      this.tts = new SystemTTS();
+    } else {
+      this.tts = new MsEdgeTTS(true);
+      this.tts.setMetadata(config.currentMetadata || DEFAULT_VOICE, OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
+    }
   }
 
   changeMetadata(voice) {
@@ -852,7 +967,7 @@ class Controller {
         this.cacheIndex++;
         continue;
       }
-      const player = new Player(this.tts, this, false);
+      const player = new Player(this.tts, this, this.engine);
       player.load(this.blocks[this.cacheIndex]);
       logger.info("[Controller]\tCreate player cache", "id=", player.id);
       this.plugin.setStatus(`正在缓存块, 编号: ${this.cacheIndex + 1}`);
@@ -954,11 +1069,19 @@ module.exports = class TTSPlugin extends Plugin {
 
   playbackRate = 1;
 
+  currentEngine = 'edge';
+
+  currentSystemVoice = '';
+
+  systemVoices = [];
+
   async loadStorage() {
     const config = await this.loadData('config.json');
     if (config) {
       this.currentMetadata = config.currentMetadata || DEFAULT_VOICE;
       this.playbackRate = config.playbackRate || 1;
+      this.currentEngine = (config.currentEngine === 'local') ? 'edge' : (config.currentEngine || 'edge');
+      this.currentSystemVoice = config.currentSystemVoice || '';
     }
   }
 
@@ -966,11 +1089,20 @@ module.exports = class TTSPlugin extends Plugin {
     await this.saveData('config.json', JSON.stringify({
       currentMetadata: this.currentMetadata,
       playbackRate: this.playbackRate,
+      currentEngine: this.currentEngine,
+      currentSystemVoice: this.currentSystemVoice,
     }));
   }
 
   onload() {
     this.loadStorage();
+    // Pre-fetch system voices (used by the "系统语音" engine)
+    if (typeof window !== 'undefined' && window.speechSynthesis) {
+      this.systemVoices = window.speechSynthesis.getVoices() || [];
+      window.speechSynthesis.onvoiceschanged = () => {
+        this.systemVoices = window.speechSynthesis.getVoices() || [];
+      };
+    }
     this.controller = null;
 
     this.status = this.i18n.title;
@@ -978,13 +1110,16 @@ module.exports = class TTSPlugin extends Plugin {
     this.addCommand({
       langKey: "quickOpen",
       hotkey: "⌥⌘W",
-      callback: () => {
+      callback: async () => {
+        if (!(await this.ensureEngineReady())) return;
         // 如果有鼠标框选的内容，朗读这些
         const content = window.getSelection().toString();
         if (content) {
           this.controller = new Controller({
             currentMetadata: this.currentMetadata,
-            playbackRate: this.playbackRate
+            playbackRate: this.playbackRate,
+            engine: this.currentEngine,
+            currentSystemVoice: this.currentSystemVoice,
           }, this, false);
           this.controller.loadContent(content);
           return this.controller.play();
@@ -994,7 +1129,9 @@ module.exports = class TTSPlugin extends Plugin {
         if (blocks.length > 0) {
           this.controller = new Controller({
             currentMetadata: this.currentMetadata,
-            playbackRate: this.playbackRate
+            playbackRate: this.playbackRate,
+            engine: this.currentEngine,
+            currentSystemVoice: this.currentSystemVoice,
           }, this, false);
           this.controller.loadBlocks([...blocks]);
           return this.controller.play();
@@ -1042,9 +1179,12 @@ module.exports = class TTSPlugin extends Plugin {
           if (this.controller) {
             this.controller.stop();
           }
+          if (!(await this.ensureEngineReady())) return;
           this.controller = new Controller({
             currentMetadata: this.currentMetadata,
-            playbackRate: this.playbackRate
+            playbackRate: this.playbackRate,
+            engine: this.currentEngine,
+            currentSystemVoice: this.currentSystemVoice,
           }, this, false);
           this.controller.loadBlocks(blocks);
           this.controller.play();
@@ -1059,6 +1199,7 @@ module.exports = class TTSPlugin extends Plugin {
           if (this.controller) {
             this.controller.stop();
           }
+          if (!(await this.ensureEngineReady())) return;
 
           // Get current block ID
           const currentBlockId = blocks[0].getAttribute('data-node-id');
@@ -1093,7 +1234,9 @@ module.exports = class TTSPlugin extends Plugin {
 
           this.controller = new Controller({
             currentMetadata: this.currentMetadata,
-            playbackRate: this.playbackRate
+            playbackRate: this.playbackRate,
+            engine: this.currentEngine,
+            currentSystemVoice: this.currentSystemVoice,
           }, this, false);
           this.controller.loadBlocks(allBlocks);
           this.controller.play();
@@ -1124,9 +1267,12 @@ module.exports = class TTSPlugin extends Plugin {
           if (this.controller) {
             this.controller.stop();
           }
+          if (!(await this.ensureEngineReady())) return;
           this.controller = new Controller({
             currentMetadata: this.currentMetadata,
-            playbackRate: this.playbackRate
+            playbackRate: this.playbackRate,
+            engine: this.currentEngine,
+            currentSystemVoice: this.currentSystemVoice,
           }, this, false);
           this.controller.loadBlocks(blocks);
           this.controller.play();
@@ -1165,7 +1311,12 @@ module.exports = class TTSPlugin extends Plugin {
     this.updateStatus(content);
   }
 
+  async ensureEngineReady() {
+    return true;
+  }
+
   addMenu(rect) {
+    this._menuRect = rect;
     const menu = new Menu("ttsPluginTopBarMenu");
     menu.addItem({
       icon: "iconPause",
@@ -1208,22 +1359,61 @@ module.exports = class TTSPlugin extends Plugin {
       },
     });
 
-    const sumMenus = Object.keys(this.metadataMap).map((v) => {
-      return {
+    // Engine selection submenu
+    const engineMenus = [
+      { key: 'edge', label: this.i18n.engineOnline },
+      { key: 'system', label: this.i18n.engineSystem },
+    ].map((e) => ({
+      icon: e.key === this.currentEngine ? 'iconSelect' : '',
+      label: e.label,
+      click: () => {
+        this.currentEngine = e.key;
+        this.saveStorage();
+      },
+    }));
+
+    menu.addItem({
+      icon: '',
+      label: this.i18n.engineTitle,
+      type: 'submenu',
+      submenu: engineMenus,
+    });
+
+    // Voice selection submenu (depends on the selected engine)
+    let voiceMenus;
+    if (this.currentEngine === 'system') {
+      const sysVoices = (window.speechSynthesis ? window.speechSynthesis.getVoices() : []) || [];
+      this.systemVoices = sysVoices;
+      voiceMenus = sysVoices.length
+        ? sysVoices.map((v) => ({
+            icon: v.name === this.currentSystemVoice ? 'iconSelect' : '',
+            label: v.name,
+            click: () => {
+              this.currentSystemVoice = v.name;
+              this.saveStorage();
+            },
+          }))
+        : [{
+            icon: 'iconInfo',
+            label: this.i18n.voiceSystemNone || '未检测到系统语音',
+            click: () => {},
+          }];
+    } else {
+      voiceMenus = Object.keys(this.metadataMap).map((v) => ({
         icon: this.metadataMap[v] === this.currentMetadata ? 'iconSelect' : '',
         label: v,
         click: () => {
           this.currentMetadata = this.metadataMap[v];
           this.saveStorage();
         },
-      };
-    });
+      }));
+    }
 
     menu.addItem({
-      icon: "",
+      icon: '',
       label: this.i18n.changeMetadata,
-      type: "submenu",
-      submenu: sumMenus,
+      type: 'submenu',
+      submenu: voiceMenus,
     });
     menu.open({
       x: rect.right,
